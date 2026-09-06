@@ -17,6 +17,9 @@
 //      전부 끝나야 E,US_CAL 을 한 번에 내보내서, 하나만 물려 놓고 시험하면
 //      아무것도 안 나온다.
 //   4) 판정 게이트(노면 창, 보정)를 통과 못 한 이유를 매번 찍는다.
+//   5) T 줄의 IMU / FSR / 홀센서 / 모터 자리는 진짜 값이 아니라 TEL_* 에
+//      박아 둔 자리값이다. 초음파 필드(us_l/us_c/us_r/risk/hazard)만 실제
+//      측정에서 나온다. 파이에서 볼 때 그 다섯 개만 믿을 것.
 //
 // 판정 로직 자체(기하, 중앙값 필터, 확정 프레임, 임계값)는 merge.ino 의
 // TERRAIN_THRESHOLD_FROM_CALIBRATION 0 쪽과 같다. 속도는 IMU 가 없으므로
@@ -34,7 +37,11 @@
 //   E,US_CAL,<센서>,<기준거리>,<잡음>,<턱시작>,<턱확정>,<홈시작>   센서마다 1줄
 //   E,US_ODD,<센서>,<실측mm>,<계산mm>   평지가 아닌 것을 보고 있다(보정 재시작)
 //   H,<risk>,<hazard>,<센서>,<거리mm>,<너비mm>,<깊이mm>   위험 판정이 바뀔 때
-//   S,<us_l>,<us_c>,<us_r>,<risk>,<hazard>                500ms 요약
+//   T,3,<seq>,<pitch>,<slope>,<fsr1>,<fsr2>,<handle>,<belt>,<mode>,<pwm>,
+//     <motor>,<us_l>,<us_c>,<us_r>,<risk>,<hazard>          500ms 주기
+//        merge.ino 의 텔레메트리와 같은 17필드 포맷 3 이다. 파이의
+//        app_3_12.py 가 그대로 파싱한다. 이 스케치에 없는 하드웨어(IMU /
+//        FSR / 홀센서 / 모터) 자리는 아래 TEL_* 자리값이 들어간다.
 //
 // 확인 순서
 //   아무 줄도 안 나온다        -> 보 레이트(9600) / 포트 / 보드 선택
@@ -42,7 +49,7 @@
 //   R 줄은 나오는데 편차가 NA  -> 센서가 노면을 안 보고 있다. 높이/각도를
 //                                 실제 장착에 맞춰 아래 상수를 고칠 것
 //   E,US_ODD 가 반복된다       -> 앞에 벽/책상이 있거나 장착이 설정과 다르다
-//   E,US_CAL 이 나온 뒤        -> 여기서부터 H 줄이 나온다
+//   E,US_CAL 이 나온 뒤        -> 여기서부터 H 줄과 유효한 T 줄이 나온다
 // ============================================================
 
 const unsigned long SERIAL_BAUD = 9600;   // merge.ino 와 같다
@@ -125,7 +132,26 @@ const float US_MIN_INTERVAL_S = 0.01;
 const unsigned long RISK_HOLD_MS = 1500;
 const float SPEED_FIXED_MPS = 0.40;   // IMU 가 없으므로 고정값
 
-const unsigned long SUMMARY_INTERVAL_MS = 500;
+// merge.ino 와 같은 주기.
+const unsigned long TELEMETRY_INTERVAL_MS = 500;
+
+// ===================== 텔레메트리 자리값 =====================
+// merge.ino 의 T 줄은 17필드 고정이라 IMU / FSR / 홀센서 / 모터 자리를 비울
+// 수 없다(파이 파서가 len(p) != 17 이면 통째로 버린다). 이 스케치에는 그
+// 하드웨어가 없으므로 아래 값을 그대로 채워 보낸다.
+//
+// mode 는 1 = SENSOR_FAULT 다. IMU 가 실제로 없으니 이게 정직한 값이다.
+// 앱이 SENSOR_FAULT 를 경고로 띄워서 초음파 확인에 방해가 되면 5(FLAT)로
+// 바꿔도 된다 -- 다만 그건 없는 IMU 가 정상이라고 말하는 셈이다.
+const float   TEL_PITCH_DEG = 0.00;  // [3]  도
+const uint8_t TEL_SLOPE     = 0;     // [4]  FLAT
+const int     TEL_FSR1      = 0;     // [5]
+const int     TEL_FSR2      = 0;     // [6]
+const uint8_t TEL_HANDLE    = 0;     // [7]  놓음
+const uint8_t TEL_BELT      = 0;     // [8]  풀림
+const uint8_t TEL_MODE      = 1;     // [9]  SENSOR_FAULT
+const uint8_t TEL_PWM       = 0;     // [10]
+const uint8_t TEL_MOTOR     = 0;     // [11] COAST
 
 // ===================== 형 =====================
 enum RiskLevel : uint8_t { RISK_SAFE = 0, RISK_CAUTION = 1, RISK_DANGER = 2 };
@@ -183,7 +209,8 @@ uint8_t overallRiskSensor = 255;
 RiskLevel reportedRisk = RISK_SAFE;
 HazardCause reportedHazard = HAZARD_NONE;
 
-unsigned long lastSummaryAt = 0;
+unsigned long lastTelemetryAt = 0;
+uint8_t telemetrySeq = 0;
 
 void resetDetector(uint8_t index);
 void setupTerrainDetectors();
@@ -192,6 +219,7 @@ float terrainDeviationM(uint8_t index, uint16_t distanceMm);
 void runTerrainDetector(uint8_t index, uint16_t distanceMm, unsigned long now);
 void updateOverallRisk(unsigned long now);
 void outputHazardLine();
+void outputTelemetry();
 void measureOne(uint8_t index);
 
 void setup() {
@@ -227,7 +255,7 @@ void setup() {
 
   unsigned long now = millis();
   usPingStartedAtMs = now;
-  lastSummaryAt = now;
+  lastTelemetryAt = now;
   for (uint8_t i = 0; i < US_COUNT; i++) {
     detectors[i].lastSampleAtMs = now;
     detectors[i].riskAtMs = now;
@@ -252,18 +280,9 @@ void loop() {
     outputHazardLine();
   }
 
-  if (now - lastSummaryAt >= SUMMARY_INTERVAL_MS) {
-    lastSummaryAt = now;
-    Serial.print(F("S,"));
-    Serial.print(usDistanceMm[0]);
-    Serial.print(',');
-    Serial.print(usDistanceMm[1]);
-    Serial.print(',');
-    Serial.print(usDistanceMm[2]);
-    Serial.print(',');
-    Serial.print((uint8_t)overallRisk);
-    Serial.print(',');
-    Serial.println((uint8_t)overallHazard);
+  if (now - lastTelemetryAt >= TELEMETRY_INTERVAL_MS) {
+    lastTelemetryAt = now;
+    outputTelemetry();
   }
 }
 
@@ -629,6 +648,47 @@ void outputHazardLine() {
   Serial.print(',');
   Serial.println(depthMm);
 
+  reportedRisk = overallRisk;
+  reportedHazard = overallHazard;
+}
+
+// merge.ino 의 outputTelemetry 와 같은 고정 순서 17필드 CSV.
+// 초음파 필드만 실제 측정에서 나오고 나머지는 TEL_* 자리값이다.
+void outputTelemetry() {
+  Serial.print(F("T,3,"));
+  Serial.print(telemetrySeq);
+  Serial.print(',');
+  Serial.print(TEL_PITCH_DEG, 2);
+  Serial.print(',');
+  Serial.print(TEL_SLOPE);
+  Serial.print(',');
+  Serial.print(TEL_FSR1);
+  Serial.print(',');
+  Serial.print(TEL_FSR2);
+  Serial.print(',');
+  Serial.print(TEL_HANDLE);
+  Serial.print(',');
+  Serial.print(TEL_BELT);
+  Serial.print(',');
+  Serial.print(TEL_MODE);
+  Serial.print(',');
+  Serial.print(TEL_PWM);
+  Serial.print(',');
+  Serial.print(TEL_MOTOR);
+  Serial.print(',');
+  Serial.print(usDistanceMm[0]);
+  Serial.print(',');
+  Serial.print(usDistanceMm[1]);
+  Serial.print(',');
+  Serial.print(usDistanceMm[2]);
+  Serial.print(',');
+  Serial.print((uint8_t)overallRisk);
+  Serial.print(',');
+  Serial.println((uint8_t)overallHazard);
+
+  telemetrySeq++;
+
+  // 텔레메트리로 나간 값이 곧 앱이 아는 최신 상태다.
   reportedRisk = overallRisk;
   reportedHazard = overallHazard;
 }
