@@ -6,8 +6,9 @@
 // 때, 그게 센서 문제인지 판정 게이트 문제인지 가르는 용도다.
 //
 // merge.ino 와 일부러 다르게 한 것 (전부 시험 편의용이다)
-//   1) 보 레이트를 115200 으로 올렸다. 매 측정마다 한 줄을 뱉으면 9600 은
-//      초당 약 1.3kB 가 필요해 송신 버퍼가 막힌다.
+//   1) 보 레이트는 merge.ino 와 같은 9600 이다. 다만 매 측정마다 한 줄을
+//      뱉으면 9600 으로는 세 센서분을 감당하지 못해, R 줄은 기본적으로
+//      US_PRINT_RAW_SENSOR 한 개분만 나간다(merge.ino 와 같은 처리).
 //   2) 측정 상한을 1m -> 4m 로 늘렸다. merge.ino 는 노면만 보므로 1m 를
 //      넘으면 전부 0(측정 실패)이 되는데, 책상 위에서 앞을 보게 두면
 //      "센서가 죽은 것"과 구분이 안 된다. 여기서는 원시값을 그대로 본다.
@@ -25,6 +26,7 @@
 //   E,US_BEAM,<센서>,<빔길이mm>,<전방주시mm>       부팅 시 3줄
 //   E,US_EXPECT,<센서>,<기준거리mm>,<노면창 하한mm>,<상한mm>
 //   R,<센서>,<원시mm>,<중앙값mm>,<편차mm|NA>,<에코us>,<실패원인>  매 측정
+//        기본은 US_PRINT_RAW_SENSOR 한 개분만 나간다
 //        실패원인 0=정상 1=에코 안 올라옴(배선/전원) 2=에코 안 내려옴
 //                 3=거리 범위 밖
 //        편차 NA = 노면 창 밖. 판정에 들어가지 못한다.
@@ -34,7 +36,7 @@
 //   S,<us_l>,<us_c>,<us_r>,<risk>,<hazard>                500ms 요약
 //
 // 확인 순서
-//   아무 줄도 안 나온다        -> 보 레이트(115200) / 포트 / 보드 선택
+//   아무 줄도 안 나온다        -> 보 레이트(9600) / 포트 / 보드 선택
 //   R 줄의 실패원인이 계속 1   -> 그 센서의 배선(TRIG/ECHO/5V/GND)이나 전원
 //   R 줄은 나오는데 편차가 NA  -> 센서가 노면을 안 보고 있다. 높이/각도를
 //                                 실제 장착에 맞춰 아래 상수를 고칠 것
@@ -42,10 +44,18 @@
 //   E,US_CAL 이 나온 뒤        -> 여기서부터 H 줄이 나온다
 // ============================================================
 
-const unsigned long SERIAL_BAUD = 115200;
+const unsigned long SERIAL_BAUD = 9600;   // merge.ino 와 같다
 
 // 1 = 매 측정마다 R 줄을 낸다. 눈이 아프면 0.
 #define US_PRINT_RAW 1
+
+// R 줄을 낼 센서. 0=좌 1=중 2=우, 255=세 개 전부.
+// 9600 baud 는 초당 960바이트인데 R 줄 하나가 약 22바이트다. 세 개를 전부
+// 내면 센서당 45ms 주기에서 초당 약 1450바이트가 필요해 송신 버퍼가 막히고,
+// Serial.print 가 버퍼가 빌 때까지 기다리면서 측정 주기까지 늘어진다.
+// 그래서 기본은 한 센서만 본다(merge.ino 의 US_RAW_DEBUG_SENSOR 와 같은 이유).
+// 255 로 두려면 SERIAL_BAUD 를 115200 으로 올릴 것.
+#define US_PRINT_RAW_SENSOR 1
 // 1 = 3점 중앙값 필터(merge.ino 와 같음). 0 = 원시값을 그대로 판정에 넣는다.
 #define US_MEDIAN_FILTER 1
 
@@ -406,19 +416,21 @@ void runTerrainDetector(uint8_t index, uint16_t distanceMm, unsigned long now) {
   float dev = terrainDeviationM(index, distanceMm);
 
 #if US_PRINT_RAW
-  Serial.print(F("R,"));
-  Serial.print(index);
-  Serial.print(',');
-  Serial.print(rawMm);
-  Serial.print(',');
-  Serial.print(distanceMm);
-  Serial.print(',');
-  if (isnan(dev)) Serial.print(F("NA"));
-  else Serial.print((int)(dev * 1000.0));
-  Serial.print(',');
-  Serial.print(usLastPulseUs[index]);
-  Serial.print(',');
-  Serial.println(usLastFail[index]);
+  if (US_PRINT_RAW_SENSOR == 255 || index == US_PRINT_RAW_SENSOR) {
+    Serial.print(F("R,"));
+    Serial.print(index);
+    Serial.print(',');
+    Serial.print(rawMm);
+    Serial.print(',');
+    Serial.print(distanceMm);
+    Serial.print(',');
+    if (isnan(dev)) Serial.print(F("NA"));
+    else Serial.print((int)(dev * 1000.0));
+    Serial.print(',');
+    Serial.print(usLastPulseUs[index]);
+    Serial.print(',');
+    Serial.println(usLastFail[index]);
+  }
 #endif
 
   if (isnan(dev)) {
