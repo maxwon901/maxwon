@@ -190,8 +190,11 @@
 //     경사 판정이 ±90도에서 접힌다(양쪽 다 같은 방향으로 나온다).
 //     ACC_FORWARD / ACC_VERT 매핑을 볼 것.
 //   E,US_BEAM,<센서>,<빔길이mm>,<전방주시mm>  센서별 빔 기하 (부팅 시 3줄)
+//   E,US_EXPECT,<센서>,<기준거리mm>,<노면창 하한mm>,<상한mm>  부팅 시 3줄
+//                          측정값이 이 창 밖이면 보정도 판정도 시작되지 않는다
 //   E,US_CAL,<센서>,<기준거리>,<잡음>,<턱시작>,<턱확정>,<홈시작>  단위 mm
-//                          부팅 보정이 끝나면 센서별로 1줄씩 (총 3줄)
+//                          그 센서의 보정이 끝나는 순간 1줄. 센서마다 따로
+//                          나오므로, 한 센서가 막혀도 나머지는 보인다.
 //   E,US_ODD,<센서>,<실측mm>,<계산mm>  평지가 아닌 것을 보고 있다.
 //                          보정을 버리고 다시 잰다. 그 센서는 이 줄이 멈추고
 //                          E,US_CAL이 나올 때까지 판정에 참여하지 않는다.
@@ -199,7 +202,8 @@
 //                          임계값도 믿을 게 못 되니 측정을 먼저 볼 것.
 //
 // US_RAW_DEBUG를 1로 두면 진단용 줄이 추가로 나간다 (기본 0).
-//   R,<센서>,<원시mm>,<중앙값mm>,<편차mm>,<에코us>,<실패원인>  매 측정마다
+//   R,<센서>,<원시mm>,<중앙값mm>,<편차mm>,<에코us>,<실패원인>  매 측정
+//                          US_RAW_DEBUG_SENSOR 로 센서를 고른다 (255=전부)마다
 //
 // HUMAN_READABLE_LOG를 1로 바꾸면 '#'로 시작하는 사람이 읽는 줄이 하나 더
 // 나간다(기본 0, 현장 확인용). 아래 파서는 어차피 무시한다.
@@ -298,7 +302,14 @@
 // 편차는 평지 기준거리 대비 노면 높이 변화다(+ 홈 / - 턱). 서 있으면 이 값이
 // 0 근처에 머물러야 한다. 두 값 사이를 규칙적으로 오가면 센서 간 크로스토크,
 // 불규칙하게 튀면 반향이 약한 것이다.
-// 9600 baud에서 한 센서분(약 20바이트 / 45ms)이 한계라 한 번에 하나만 본다.
+// 0=좌 1=중 2=우, 255=세 개 전부.
+// 9600 baud는 초당 960바이트인데 R 줄 하나가 최대 28바이트다. 한 센서분
+// (45ms 주기)이면 초당 약 620바이트라 T 줄과 같이 나가도 여유가 있다.
+// 255로 세 개를 다 내면 초당 약 1900바이트가 필요해 송신 버퍼가 막히고,
+// Serial.print가 버퍼를 기다리면서 측정 주기가 45ms에서 약 100ms로 늘어난다.
+// US_STALE_INTERVAL_S(0.25s) 안쪽이라 판정 자체는 계속 돌지만, 확정에
+// 걸리는 시간이 두 배가 되어 경보가 그만큼 늦게 뜬다. 주행 중에는 한 센서만,
+// 세워 놓고 세 개를 비교할 때만 255로 둘 것.
 #define US_RAW_DEBUG 0
 #define US_RAW_DEBUG_SENSOR 1
 
@@ -839,7 +850,6 @@ unsigned long lastSlopeAt = 0;
 unsigned long lastControlAt = 0;
 unsigned long lastTelemetryAt = 0;
 
-bool baselineReported = false;
 
 bool writeRegister(uint8_t reg, uint8_t value);
 bool readRegisters(uint8_t startReg, uint8_t *data, uint8_t length);
@@ -963,6 +973,18 @@ void setup() {
     Serial.print((int)(usBeamFootprintM[i] * 1000.0));
     Serial.print(',');
     Serial.println((int)(usLookAheadM[i] * 1000.0));
+
+    // 이 센서가 노면으로 인정하는 거리 창. 측정값이 이 밖이면 편차가
+    // 계산되지 않아 보정도 판정도 시작되지 않는다. 장착 높이/각도가
+    // 실제와 다를 때 그 사실이 여기서 바로 드러난다.
+    Serial.print(F("E,US_EXPECT,"));
+    Serial.print(i);
+    Serial.print(',');
+    Serial.print((int)(usBaselineComputedM[i] * 1000.0));
+    Serial.print(',');
+    Serial.print((int)(usExpectedFlatM[i] * US_GROUND_MIN_RATIO * 1000.0));
+    Serial.print(',');
+    Serial.println((int)(usExpectedFlatM[i] * US_GROUND_MAX_RATIO * 1000.0));
   }
 
   unsigned long now = millis();
@@ -1025,32 +1047,6 @@ void loop() {
   // 초음파는 매 loop마다 상태를 진행시킨다. 블로킹은 트리거 10us뿐.
   // 한 센서의 측정이 끝나면 그 자리에서 노면 위험 판정 한 프레임이 돈다.
   updateUltrasonic(now);
-
-  // 평지 기준거리 보정이 끝나면 실측값을 한 번 알린다.
-  if (!baselineReported) {
-    bool done = true;
-    for (uint8_t i = 0; i < US_COUNT; i++) {
-      if (detectors[i].baselineCount < US_BASELINE_SAMPLES) done = false;
-    }
-    if (done && usPhase == US_IDLE) {
-      baselineReported = true;
-      // 센서별로 실측 기준거리, 잡음, 거기서 만든 임계값을 알린다 (mm)
-      for (uint8_t i = 0; i < US_COUNT; i++) {
-        Serial.print(F("E,US_CAL,"));
-        Serial.print(i);
-        Serial.print(',');
-        Serial.print((int)(usBaselineM[i] * 1000.0));
-        Serial.print(',');
-        Serial.print((int)(detectors[i].noiseM * 1000.0));
-        Serial.print(',');
-        Serial.print((int)(detectors[i].stepEnterM * 1000.0));
-        Serial.print(',');
-        Serial.print((int)(detectors[i].stepDangerM * 1000.0));
-        Serial.print(',');
-        Serial.println((int)(detectors[i].holeEnterM * 1000.0));
-      }
-    }
-  }
 
   // 위험 판정 유지시간이 지났는지 확인하고 세 센서를 합친다.
   updateOverallRisk(now);
@@ -1648,7 +1644,7 @@ void runTerrainDetector(uint8_t index, uint16_t distanceMm, unsigned long now) {
   float dev = terrainDeviationM(index, distanceMm);
 
 #if US_RAW_DEBUG
-  if (index == US_RAW_DEBUG_SENSOR) {
+  if (US_RAW_DEBUG_SENSOR == 255 || index == US_RAW_DEBUG_SENSOR) {
     Serial.print(F("R,"));
     Serial.print(index);
     Serial.print(',');
@@ -1752,6 +1748,23 @@ void runTerrainDetector(uint8_t index, uint16_t distanceMm, unsigned long now) {
       // 센서별 고정값을 그대로 쓴다. 기준거리만 실측으로 잡는다.
       applyFixedThresholds(index);
 #endif
+
+      // 이 센서의 보정 결과를 그 자리에서 알린다 (mm).
+      // 예전에는 세 센서가 전부 끝나야 loop()에서 한 번에 냈는데, 그러면
+      // 하나가 배선이 빠졌거나 노면을 안 보고 있을 때 나머지 둘이 멀쩡히
+      // 보정돼도 한 줄도 나오지 않았다. 센서별로 내면 어디까지 됐는지 보인다.
+      Serial.print(F("E,US_CAL,"));
+      Serial.print(index);
+      Serial.print(',');
+      Serial.print((int)(usBaselineM[index] * 1000.0));
+      Serial.print(',');
+      Serial.print((int)(d.noiseM * 1000.0));
+      Serial.print(',');
+      Serial.print((int)(d.stepEnterM * 1000.0));
+      Serial.print(',');
+      Serial.print((int)(d.stepDangerM * 1000.0));
+      Serial.print(',');
+      Serial.println((int)(d.holeEnterM * 1000.0));
 
       // 보정 구간이 이미 심하게 흔들렸다면 기준거리도 임계값도 믿을 게 못
       // 된다. 측정을 먼저 봐야 하므로 알려 준다.
