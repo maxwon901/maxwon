@@ -115,8 +115,9 @@
 // 임계값 스위치 (TERRAIN_THRESHOLD_FROM_CALIBRATION)
 // ------------------------------------------------------------
 // 노면 판정 임계값을 어디서 얻을지 아래 스위치 한 줄로 고른다.
-//     0  <- 현재 값. 턱시작 20mm / 턱확정 40mm / 홈시작 40mm 를 그대로 쓴다.
-//           부팅 보정은 평지 기준거리(d0)만 잡는다.
+//     0  <- 현재 값. 아래 STEP_DANGER_FIXED_CM / HOLE_ENTER_FIXED_CM 에
+//           센서별로 적은 값을 그대로 쓴다(좌/중/우 턱확정 16/30/12cm,
+//           홈시작 20/50/18cm). 부팅 보정은 평지 기준거리(d0)만 잡는다.
 //     1     부팅 보정에서 잡음까지 재서 임계값을 그 배수로 만들고, 빔
 //           기하에서 나오는 하한(홈의 점프 상한, 경사로가 만드는 겉보기
 //           턱)을 함께 씌운다.
@@ -477,11 +478,48 @@ const float US_GROUND_MAX_RATIO = 3.00;
 // 두 판의 차이는 파일 상단 '임계값 스위치' 항목에 정리해 두었다.
 #define TERRAIN_THRESHOLD_FROM_CALIBRATION 0
 
-// 스위치가 0일 때 쓰는 고정 임계값.
-const float STEP_ENTER_FIXED_M = 0.020;
-const float STEP_DANGER_FIXED_M = 0.040;
-const float HOLE_ENTER_FIXED_M = 0.040;
-const float TERRAIN_EXIT_FIXED_M = 0.010;
+// 스위치가 0일 때 쓰는 고정 임계값. 센서마다 따로 잡는다.
+// 단위는 cm 다. 판정 내부는 m로 돌아가고 E,US_CAL 줄은 mm로 나가므로,
+// applyFixedThresholds가 100으로 나눠 옮겨 담는다.
+//
+// 이 값은 '노면 높이가 평지 기준에서 얼마나 벗어났는가'다. 측정 거리 자체가
+// 아니라 편차이고, 부호는 턱이 위(노면이 올라옴) / 홈이 아래다.
+//
+// 센서마다 다른 이유는 각도가 달라서다. 중앙 45도는 전방 160mm를 보기 때문에
+// 경사로에 들어가는 것도 노면이 올라오는 것으로 보이고(160mm * tan10도 = 28mm),
+// 빔 띠가 86mm라 좁은 홈이 만드는 겉보기 점프도 48mm로 크다. 그래서 중앙만
+// 임계가 높다. 좌우 65도는 전방 75mm / 빔 띠 51mm라 그만큼 낮게 잡는다.
+//
+// 턱은 시작(상태 진입)과 확정(DANGER) 두 단계인데, 여기 적는 값은 확정
+// 임계다. 시작 임계는 그 절반으로 자동으로 잡는다 -- 원래 코드의 20:40
+// 비율을 그대로 옮긴 것이다.
+//                                            좌     중     우
+const float STEP_DANGER_FIXED_CM[US_COUNT] = { 16.0,  30.0,  12.0 };
+const float HOLE_ENTER_FIXED_CM[US_COUNT]  = { 20.0,  50.0,  18.0 };
+const float STEP_ENTER_RATIO = 0.5;       // 턱시작 = 턱확정 * 이 비율
+const float TERRAIN_EXIT_FIXED_CM = 1.0;  // 노면 복귀
+
+// ------------------------------------------------------------
+// 주의: 위 여섯 값 중 셋은 지금 설치(높이 16cm, 45/65도)에서 물리적으로
+// 발동하지 않는다. 편차가 그만큼 나오려면 아래 측정 거리가 필요한데, 그
+// 거리가 유효 측정창(좌우 26~530mm, 중앙 34~679mm) 밖이기 때문이다.
+// 창 밖 측정은 노면이 아니라고 보고 '측정 실패'로 버려진다.
+//
+//   좌 턱 16cm -> 측정거리   0mm 필요   발동 불가
+//   중 턱 30cm -> 측정거리  음수 필요   발동 불가
+//   중 홈 50cm -> 측정거리 832mm 필요   발동 불가 (창 상한 679mm)
+//   우 턱 12cm -> 측정거리  42mm        발동 가능 (노면이 센서 4cm 앞까지)
+//   좌 홈 20cm -> 측정거리 378mm        발동 가능
+//   우 홈 18cm -> 측정거리 356mm        발동 가능
+//
+// 즉 턱·단차를 맡는 중앙 센서는 경보를 한 번도 내지 않는다. 편차의 물리적
+// 상한은 센서 높이(16cm) 근처이고, 중앙 홈은 창 상한이 먼저 걸린다.
+// 되살리려면 둘 중 하나다.
+//   - 이 값들을 편차 실측 범위(수 cm)로 낮춘다.
+//   - 중앙 홈만 살리려면 US_GROUND_MAX_RATIO(3.00)와 US_MAX_VALID_MM(1000),
+//     US_MAX_ECHO_US(6000)를 함께 올려 창을 832mm 위로 넓힌다. 턱 쪽은
+//     창을 넓혀도 상한이 센서 높이라 살아나지 않는다.
+// ------------------------------------------------------------
 
 const float STEP_ENTER_SIGMA = 4.0;    // 턱 판정 시작 = 잡음의 몇 배
 const float STEP_DANGER_SIGMA = 8.0;   // 턱 확정
@@ -539,6 +577,20 @@ const float US_BASELINE_MAX_NOISE_M = 0.015;  // 이보다 흔들리면 경고�
 // 발이나 사람처럼 빔에 걸쳤다 빠졌다 하는 것이 한 프레임씩 튀면서 턱과 홈을
 // 번갈아 만들어내는 것을 막는다. 1로 두면 예전처럼 한 프레임에 바로 판정한다.
 const uint8_t TERRAIN_CONFIRM_FRAMES = 2;
+
+// 위험(DANGER)을 내보내기 전에 위험 조건 자체가 몇 프레임 연속으로
+// 반복돼야 하는지. TERRAIN_CONFIRM_FRAMES가 '상태에 들어가는' 문턱이라면
+// 이쪽은 '경보를 내는' 문턱이다.
+//   턱 : 편차가 턱확정 임계를 이만큼 연속으로 넘어야 DANGER. 예전에는
+//        상태에 들어간 뒤 한 프레임만 넘어도 바로 확정했다.
+//   홈 : 홈 진입이 곧 위험 판정이라 진입 표를 이 값까지 세고 나서 낸다.
+// 1로 두면 예전처럼 한 프레임에 바로 확정한다. 값이 튈 때 올린다.
+const uint8_t TERRAIN_DANGER_CONFIRM_FRAMES = 2;
+
+// 홈은 진입 조건과 위험 조건이 같아서, 둘 중 큰 쪽을 쓰면 두 규칙을 모두 만족한다.
+const uint8_t HOLE_DANGER_VOTES =
+    (TERRAIN_CONFIRM_FRAMES > TERRAIN_DANGER_CONFIRM_FRAMES)
+        ? TERRAIN_CONFIRM_FRAMES : TERRAIN_DANGER_CONFIRM_FRAMES;
 
 // 측정 주기
 //   센서 하나가 다시 측정될 때까지의 시간은 US_PING_INTERVAL_MS * US_COUNT,
@@ -683,6 +735,7 @@ struct DangerDetector {
   float stepPeakM;         // 턱 상태에서 본 최대 높이
   uint8_t holeVotes;       // 같은 방향이 연속으로 보인 프레임 수
   uint8_t stepVotes;
+  uint8_t dangerVotes;     // 위험 조건이 연속으로 보인 프레임 수
   unsigned long lastSampleAtMs;
   uint16_t recentMm[3];    // 중앙값 필터용 최근 유효 측정
   uint8_t recentCount;
@@ -808,6 +861,7 @@ uint16_t pulseToMm(unsigned long pulseUs);
 bool obstacleTooClose();
 void setupTerrainDetectors();
 void resetDetector(uint8_t index);
+void applyFixedThresholds(uint8_t index);
 float terrainDeviationM(uint8_t index, uint16_t distanceMm);
 void runTerrainDetector(uint8_t index, uint16_t distanceMm, unsigned long now);
 void updateOverallRisk(unsigned long now);
@@ -1485,6 +1539,19 @@ void setupTerrainDetectors() {
   }
 }
 
+// 센서별 고정 임계값을 cm에서 m로 옮겨 담는다.
+// 턱시작이 복귀 임계보다 낮으면 상태에 들어가자마자 빠져나와 턱을 영영 못
+// 잡는다. 우측처럼 임계가 낮은 센서에서 실제로 생기므로 복귀 임계를 턱시작의
+// 절반 아래로 눌러 둔다(보정 판에서 쓰던 것과 같은 규칙이다).
+void applyFixedThresholds(uint8_t index) {
+  DangerDetector &d = detectors[index];
+  d.stepDangerM = STEP_DANGER_FIXED_CM[index] / 100.0;
+  d.stepEnterM = d.stepDangerM * STEP_ENTER_RATIO;
+  d.holeEnterM = HOLE_ENTER_FIXED_CM[index] / 100.0;
+  d.exitM = TERRAIN_EXIT_FIXED_CM / 100.0;
+  if (d.exitM > d.stepEnterM * 0.5) d.exitM = d.stepEnterM * 0.5;
+}
+
 // 판정 상태를 모두 버린다. 기준거리 실측값도 다시 잡는다.
 void resetDetector(uint8_t index) {
   DangerDetector &d = detectors[index];
@@ -1494,6 +1561,7 @@ void resetDetector(uint8_t index) {
   d.stepPeakM = 0.0;
   d.holeVotes = 0;
   d.stepVotes = 0;
+  d.dangerVotes = 0;
   d.pendingIntervalS = 0.0;
   d.recentCount = 0;
   d.recentMm[0] = d.recentMm[1] = d.recentMm[2] = 0;
@@ -1501,11 +1569,15 @@ void resetDetector(uint8_t index) {
   d.baselineSumSqM = 0.0;
   d.baselineCount = 0;
   d.noiseM = 0.0;
+#if TERRAIN_THRESHOLD_FROM_CALIBRATION
   // 보정이 끝나기 전에도 안전한 쪽으로 동작하도록 하한으로 채워 둔다.
   d.stepEnterM = STEP_ENTER_FLOOR_M;
   d.stepDangerM = STEP_DANGER_FLOOR_M;
   d.holeEnterM = HOLE_ENTER_FLOOR_M;
   d.exitM = STEP_ENTER_FLOOR_M * 0.5;
+#else
+  applyFixedThresholds(index);
+#endif
   d.lastSampleAtMs = millis();
   d.risk = RISK_SAFE;
   d.hazard = HAZARD_NONE;
@@ -1551,6 +1623,7 @@ void runTerrainDetector(uint8_t index, uint16_t distanceMm, unsigned long now) {
     d.holeWidthM = 0.0;
     d.holeDepthM = 0.0;
     d.stepPeakM = 0.0;
+    d.dangerVotes = 0;
     d.recentCount = 0;
     interval = US_STALE_INTERVAL_S;
   }
@@ -1676,11 +1749,8 @@ void runTerrainDetector(uint8_t index, uint16_t distanceMm, unsigned long now) {
       d.exitM = d.noiseM * TERRAIN_EXIT_SIGMA;
       if (d.exitM > d.stepEnterM * 0.5) d.exitM = d.stepEnterM * 0.5;
 #else
-      // 고정값을 그대로 쓴다. 기준거리만 실측으로 잡는다.
-      d.stepEnterM = STEP_ENTER_FIXED_M;
-      d.stepDangerM = STEP_DANGER_FIXED_M;
-      d.holeEnterM = HOLE_ENTER_FIXED_M;
-      d.exitM = TERRAIN_EXIT_FIXED_M;
+      // 센서별 고정값을 그대로 쓴다. 기준거리만 실측으로 잡는다.
+      applyFixedThresholds(index);
 #endif
 
       // 보정 구간이 이미 심하게 흔들렸다면 기준거리도 임계값도 믿을 게 못
@@ -1715,9 +1785,10 @@ void runTerrainDetector(uint8_t index, uint16_t distanceMm, unsigned long now) {
         d.stepVotes = 0;
       }
 
-      if (d.holeVotes >= TERRAIN_CONFIRM_FRAMES) {
+      if (d.holeVotes >= HOLE_DANGER_VOTES) {
         // 빔 띠가 safe_gap보다 길어서, 보이기 시작한 홈은 이미 바퀴가
-        // 빠지는 크기다. 바로 알린다.
+        // 빠지는 크기다. 표를 여기까지 셌다는 것은 홈 조건이 그만큼 연속으로
+        // 반복됐다는 뜻이므로 이 자리에서 알린다.
         d.state = TERRAIN_HOLE;
         d.holeDepthM = dev;
         d.holeWidthM = usBeamFootprintM[index];
@@ -1741,21 +1812,34 @@ void runTerrainDetector(uint8_t index, uint16_t distanceMm, unsigned long now) {
         d.state = TERRAIN_IDLE;
         d.holeWidthM = 0.0;
         d.holeDepthM = 0.0;
+        d.dangerVotes = 0;
       }
       break;
 
     case TERRAIN_STEP:
       if (-dev > d.stepPeakM) d.stepPeakM = -dev;
-      if (d.stepPeakM >= d.stepDangerM) {
+
+      // 최대값(stepPeakM)은 한 번 올라가면 내려오지 않아서, 헛에코 한 번이
+      // 임계를 넘기면 그대로 확정돼 버린다. 그래서 확정은 최대값이 아니라
+      // '이번 프레임의 편차'가 임계를 연속으로 넘는지로 센다.
+      if (-dev > d.stepDangerM) {
+        if (d.dangerVotes < 255) d.dangerVotes++;
+      } else {
+        d.dangerVotes = 0;
+      }
+
+      if (d.dangerVotes >= TERRAIN_DANGER_CONFIRM_FRAMES) {
         risk = RISK_DANGER;
         hazard = HAZARD_STEP;
         eventDepthM = d.stepPeakM;                    // 턱 높이
         d.state = TERRAIN_IDLE;
         d.stepPeakM = 0.0;
+        d.dangerVotes = 0;
       } else if (-dev < d.exitM) {
         // 노면이 돌아왔고 크기가 작았다 = 경사로 진입이나 잔요철
         d.state = TERRAIN_IDLE;
         d.stepPeakM = 0.0;
+        d.dangerVotes = 0;
       }
       break;
   }

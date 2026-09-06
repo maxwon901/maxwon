@@ -76,10 +76,17 @@ const float US_GROUND_MIN_RATIO = 0.15;
 const float US_GROUND_MAX_RATIO = 3.00;
 
 // ===================== 판정값 (merge.ino 고정값 판과 동일) =====================
-const float STEP_ENTER_FIXED_M = 0.020;
-const float STEP_DANGER_FIXED_M = 0.040;
-const float HOLE_ENTER_FIXED_M = 0.040;
-const float TERRAIN_EXIT_FIXED_M = 0.010;
+// 센서별 고정 임계값. 단위는 cm (merge.ino 와 같은 값).
+// 노면 높이가 평지 기준에서 벗어난 양이지 측정 거리가 아니다.
+//                                            좌     중     우
+const float STEP_DANGER_FIXED_CM[US_COUNT] = { 16.0,  30.0,  12.0 };
+const float HOLE_ENTER_FIXED_CM[US_COUNT]  = { 20.0,  50.0,  18.0 };
+const float STEP_ENTER_RATIO = 0.5;       // 턱시작 = 턱확정 * 이 비율
+const float TERRAIN_EXIT_FIXED_CM = 1.0;  // 노면 복귀
+
+// 이 중 좌 턱 16cm / 중 턱 30cm / 중 홈 50cm 은 유효 측정창(좌우 26~530mm,
+// 중앙 34~679mm) 밖이라 발동하지 않는다. R 줄의 편차가 실제로 어디까지
+// 오르내리는지 보고 값을 맞추는 것이 이 스케치의 용도다.
 
 const float WHEEL_WIDTH_M = 0.07;
 const float HOLE_SAFE_GAP_M = 0.6 * WHEEL_WIDTH_M;
@@ -90,6 +97,11 @@ const float US_BASELINE_MAX_RATIO = 1.6;
 const float US_BASELINE_MAX_NOISE_M = 0.015;
 
 const uint8_t TERRAIN_CONFIRM_FRAMES = 2;
+// 위험 조건 자체가 몇 프레임 연속으로 반복돼야 DANGER 를 내보내는지.
+const uint8_t TERRAIN_DANGER_CONFIRM_FRAMES = 2;
+const uint8_t HOLE_DANGER_VOTES =
+    (TERRAIN_CONFIRM_FRAMES > TERRAIN_DANGER_CONFIRM_FRAMES)
+        ? TERRAIN_CONFIRM_FRAMES : TERRAIN_DANGER_CONFIRM_FRAMES;
 const float US_STALE_INTERVAL_S = 0.25;
 const float US_MIN_INTERVAL_S = 0.01;
 const unsigned long RISK_HOLD_MS = 1500;
@@ -109,6 +121,7 @@ struct DangerDetector {
   float stepPeakM;
   uint8_t holeVotes;
   uint8_t stepVotes;
+  uint8_t dangerVotes;
   unsigned long lastSampleAtMs;
   uint16_t recentMm[3];
   uint8_t recentCount;
@@ -317,6 +330,7 @@ void resetDetector(uint8_t index) {
   d.stepPeakM = 0.0;
   d.holeVotes = 0;
   d.stepVotes = 0;
+  d.dangerVotes = 0;
   d.pendingIntervalS = 0.0;
   d.recentCount = 0;
   d.recentMm[0] = d.recentMm[1] = d.recentMm[2] = 0;
@@ -325,10 +339,12 @@ void resetDetector(uint8_t index) {
   d.baselineCount = 0;
   d.calibrated = false;
   d.noiseM = 0.0;
-  d.stepEnterM = STEP_ENTER_FIXED_M;
-  d.stepDangerM = STEP_DANGER_FIXED_M;
-  d.holeEnterM = HOLE_ENTER_FIXED_M;
-  d.exitM = TERRAIN_EXIT_FIXED_M;
+  d.stepDangerM = STEP_DANGER_FIXED_CM[index] / 100.0;
+  d.stepEnterM = d.stepDangerM * STEP_ENTER_RATIO;
+  d.holeEnterM = HOLE_ENTER_FIXED_CM[index] / 100.0;
+  d.exitM = TERRAIN_EXIT_FIXED_CM / 100.0;
+  // 복귀 임계가 턱시작보다 높으면 상태에 들어가자마자 빠져나온다.
+  if (d.exitM > d.stepEnterM * 0.5) d.exitM = d.stepEnterM * 0.5;
   d.lastSampleAtMs = millis();
   d.risk = RISK_SAFE;
   d.hazard = HAZARD_NONE;
@@ -367,6 +383,7 @@ void runTerrainDetector(uint8_t index, uint16_t distanceMm, unsigned long now) {
     d.holeWidthM = 0.0;
     d.holeDepthM = 0.0;
     d.stepPeakM = 0.0;
+    d.dangerVotes = 0;
     d.recentCount = 0;
     interval = US_STALE_INTERVAL_S;
   }
@@ -486,7 +503,7 @@ void runTerrainDetector(uint8_t index, uint16_t distanceMm, unsigned long now) {
         d.stepVotes = 0;
       }
 
-      if (d.holeVotes >= TERRAIN_CONFIRM_FRAMES) {
+      if (d.holeVotes >= HOLE_DANGER_VOTES) {
         d.state = TERRAIN_HOLE;
         d.holeDepthM = dev;
         d.holeWidthM = usBeamFootprintM[index];
@@ -509,20 +526,32 @@ void runTerrainDetector(uint8_t index, uint16_t distanceMm, unsigned long now) {
         d.state = TERRAIN_IDLE;
         d.holeWidthM = 0.0;
         d.holeDepthM = 0.0;
+        d.dangerVotes = 0;
       }
       break;
 
     case TERRAIN_STEP:
       if (-dev > d.stepPeakM) d.stepPeakM = -dev;
-      if (d.stepPeakM >= d.stepDangerM) {
+
+      // 최대값은 한 번 올라가면 내려오지 않아서 헛에코 하나로 확정된다.
+      // 이번 프레임의 편차가 임계를 연속으로 넘는지로 센다.
+      if (-dev > d.stepDangerM) {
+        if (d.dangerVotes < 255) d.dangerVotes++;
+      } else {
+        d.dangerVotes = 0;
+      }
+
+      if (d.dangerVotes >= TERRAIN_DANGER_CONFIRM_FRAMES) {
         risk = RISK_DANGER;
         hazard = HAZARD_STEP;
         eventDepthM = d.stepPeakM;
         d.state = TERRAIN_IDLE;
         d.stepPeakM = 0.0;
+        d.dangerVotes = 0;
       } else if (-dev < d.exitM) {
         d.state = TERRAIN_IDLE;
         d.stepPeakM = 0.0;
+        d.dangerVotes = 0;
       }
       break;
   }
