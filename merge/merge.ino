@@ -182,6 +182,12 @@
 //     ext=0이면 외부 풀업 없음(모듈 미연결/전원없음), pu=0이면 GND 단락.
 //   E,I2C,<주소...> 또는 E,I2C,NONE   부팅 때 실패하면 한 번 버스를 훑는다.
 //   IMU가 실패해도 2초마다 다시 붙여본다. 붙으면 E,IMU_READY가 다시 나온다.
+//   E,ACC,<ax>,<ay>,<az>  부팅 보정 직후의 원시 가속도. 축 매핑 확인용으로
+//     평지에서 |값|이 16384에 가까운 축이 수직축(ACC_VERT)이어야 한다.
+//   E,PITCH0,<도>  보정에서 잡은 장착 오프셋. 정상이면 ±10도 안쪽이다.
+//   E,IMU_AXIS,<도>  그 오프셋이 30도를 넘었다. 전후축에 중력이 실려 있어
+//     경사 판정이 ±90도에서 접힌다(양쪽 다 같은 방향으로 나온다).
+//     ACC_FORWARD / ACC_VERT 매핑을 볼 것.
 //   E,US_BEAM,<센서>,<빔길이mm>,<전방주시mm>  센서별 빔 기하 (부팅 시 3줄)
 //   E,US_CAL,<센서>,<기준거리>,<잡음>,<턱시작>,<턱확정>,<홈시작>  단위 mm
 //                          부팅 보정이 끝나면 센서별로 1줄씩 (총 3줄)
@@ -336,10 +342,43 @@ const float ACCEL_SENSITIVITY = 16384.0;  // +/-2g
 const float GYRO_SENSITIVITY = 131.0;     // +/-250 deg/s
 const float FILTER_TIME_CONSTANT_S = 0.35;
 
-// 현재 프로젝트에서 확인한 세로 90도 장착 기준:
-// 전후축=-센서 Z, 좌우축=센서 Y, 수직축=센서 X, Pitch gyro=센서 Y
 // 유모차 앞부분을 들었는데 DOWN으로 나오면 true로 바꾼다.
+// accelPitchDeg와 pitchRateDps를 함께 뒤집는다. 아래 축 매핑이 맞는데
+// 부호만 반대일 때 쓰는 스위치다. '양쪽 다 같은 방향'으로 나오는 증상은
+// 이걸로 고쳐지지 않는다(양쪽 다 오르막이 양쪽 다 내리막이 될 뿐이다).
 const bool INVERT_PITCH_DIRECTION = false;
+
+// ---- 센서 축 매핑 ----
+// 어느 센서축이 유모차의 어느 축인지. 부호 포함.
+// 평지 정지 상태에서 E,ACC의 |값|이 가장 큰 축(약 16384)이 진짜 수직축이고,
+// 그 축이 ACC_VERT에 들어가야 한다.
+//
+// ACC_VERT를 잘못 잡으면 전후축에 중력이 실린다. 그러면 아래 식
+//     atan2(forwardG, sqrt(sideG^2 + verticalG^2))
+// 의 두 번째 인자가 항상 0 이상이라 결과가 -90~+90에 갇히고, 평지가 그
+// 꼭짓점(±90)에 놓인다. sqrt가 부호를 지워버리기 때문에 앞으로 기울이든
+// 뒤로 기울이든 각도가 같은 방향으로만 움직인다.
+//   2026-09 실측 증상: 어느 쪽으로 기울여도 오르막으로 판정.
+//   당시 매핑은 전후축=-Z, 수직축=X 였고, 실제로는 중력이 Z에 실려 있었다.
+//   즉 전후축과 수직축이 서로 바뀌어 있었다. 아래가 바로잡은 값이다.
+//
+// 부호 맞추는 법 (실물에서 반드시 확인):
+//   1. 평지에서 E,ACC를 보고 |값|이 큰 축을 ACC_VERT에 넣는다.
+//   2. 남은 두 축 중 앞뒤로 기울일 때 값이 크게 변하는 쪽이 ACC_FORWARD,
+//      나머지가 ACC_SIDE다.
+//   3. 유모차 앞을 들었을 때 텔레메트리 pitch가 +로 나와야 한다.
+//      -로 나오면 ACC_FORWARD의 부호를 뒤집거나
+//      INVERT_PITCH_DIRECTION을 true로 한다.
+//   4. 가속도와 자이로가 서로 반대로 움직이면(기울이는 도중에만 값이
+//      튀었다가 되돌아온다) GYRO_PITCH만 (-gy)로 뒤집는다.
+#define ACC_FORWARD   ( ax)   // 전후축: 유모차 앞이 올라가면 +
+#define ACC_SIDE      ( ay)   // 좌우축
+#define ACC_VERT      ( az)   // 수직축: 평지에서 중력이 실리는 축
+#define GYRO_PITCH    ( gy)   // 피치 각속도. 부호가 ACC_FORWARD와 맞아야 한다
+
+// 보정에서 잡은 장착 오프셋이 이 각도를 넘으면 축 매핑을 의심한다.
+// 정상 장착이면 ±10도 안쪽이고, ±90 근처면 전후축에 중력이 실린 것이다.
+const float IMU_AXIS_WARN_DEG = 30.0;
 
 // ===================== 센서 판단값 =====================
 const float FLAT_THRESHOLD_DEG = 5.0;
@@ -845,6 +884,16 @@ void setup() {
   if (bringUpIMU(true)) {
     imuReady = true;
     Serial.println(F("E,IMU_READY"));
+    // 축 매핑 확인용. 평지에 세워 둔 상태의 원시 가속도와 장착 오프셋이다.
+    // |값|이 16384에 가까운 축이 진짜 수직축이고, 그게 ACC_VERT여야 한다.
+    Serial.print(F("E,ACC,"));
+    Serial.print(ax);
+    Serial.print(',');
+    Serial.print(ay);
+    Serial.print(',');
+    Serial.println(az);
+    Serial.print(F("E,PITCH0,"));
+    Serial.println(pitchMountOffsetDeg, 2);
   } else {
     imuReady = false;
     reportImuFailure();
@@ -1068,13 +1117,13 @@ bool calibrateIMU() {
       continue;
     }
 
-    float forwardG = -az / ACCEL_SENSITIVITY;
-    float sideG = ay / ACCEL_SENSITIVITY;
-    float verticalG = ax / ACCEL_SENSITIVITY;
+    float forwardG = ACC_FORWARD / ACCEL_SENSITIVITY;
+    float sideG = ACC_SIDE / ACCEL_SENSITIVITY;
+    float verticalG = ACC_VERT / ACCEL_SENSITIVITY;
     float rawPitch = atan2(forwardG, sqrt(sideG * sideG + verticalG * verticalG))
                      * 180.0 / PI;
 
-    sumGy += gy;
+    sumGy += GYRO_PITCH;
     sumPitch += rawPitch;
     validSamples++;
     delay(5);
@@ -1084,6 +1133,13 @@ bool calibrateIMU() {
   if (validSamples < CALIBRATION_SAMPLES) { imuFailStep = 8; return false; }
   gyroYOffsetDps = (sumGy / (float)validSamples) / GYRO_SENSITIVITY;
   pitchMountOffsetDeg = sumPitch / validSamples;
+
+  // 오프셋이 ±90 근처면 전후축에 중력이 실려 있다는 뜻이라, 위 atan2가
+  // 접혀서 어느 쪽으로 기울여도 같은 부호가 나온다. 축 매핑이 틀린 것이다.
+  if (fabs(pitchMountOffsetDeg) > IMU_AXIS_WARN_DEG) {
+    Serial.print(F("E,IMU_AXIS,"));
+    Serial.println(pitchMountOffsetDeg, 1);
+  }
   return true;
 }
 
@@ -1179,13 +1235,13 @@ void scanI2cBus() {
 }
 
 void calculateIMUValues() {
-  float forwardG = -az / ACCEL_SENSITIVITY;
-  float sideG = ay / ACCEL_SENSITIVITY;
-  float verticalG = ax / ACCEL_SENSITIVITY;
+  float forwardG = ACC_FORWARD / ACCEL_SENSITIVITY;
+  float sideG = ACC_SIDE / ACCEL_SENSITIVITY;
+  float verticalG = ACC_VERT / ACCEL_SENSITIVITY;
 
   accelPitchDeg = atan2(forwardG, sqrt(sideG * sideG + verticalG * verticalG))
                   * 180.0 / PI - pitchMountOffsetDeg;
-  pitchRateDps = (gy / GYRO_SENSITIVITY) - gyroYOffsetDps;
+  pitchRateDps = (GYRO_PITCH / GYRO_SENSITIVITY) - gyroYOffsetDps;
 
   if (INVERT_PITCH_DIRECTION) {
     accelPitchDeg = -accelPitchDeg;
@@ -1220,7 +1276,7 @@ void updateIMU(unsigned long now) {
 // 전후 가속도에서 중력 성분을 빼고 적분해 전진 속도를 추정한다.
 // 파이썬 원본이 시리얼로 받던 speed를 대신하는 값이다.
 void updateSpeedEstimate(float dt, unsigned long now) {
-  float forwardG = -az / ACCEL_SENSITIVITY;
+  float forwardG = ACC_FORWARD / ACCEL_SENSITIVITY;
 
   // filteredPitchDeg는 장착 오프셋을 뺀(그리고 필요하면 부호를 뒤집은) 값이라
   // 중력 성분을 구하려면 센서가 실제로 보는 기울기로 되돌려야 한다.
